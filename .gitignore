@@ -38,7 +38,8 @@ ENV/
 
 # Data files (avoid committing large or sensitive datasets)
 *.csv
-!demo_data.csv
+!data/*.csv
+!simulations/results.csv
 
 # OS-specific
 .DS_Store

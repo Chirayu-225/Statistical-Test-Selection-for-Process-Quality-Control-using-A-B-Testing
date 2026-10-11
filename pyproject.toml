@@ -1,0 +1,12 @@
+[project]
+name = "stat-advisor"
+version = "2.0.0"
+description = "Ask a statistical question about your data and get a trustworthy, explained answer: automatic test selection for A/B tests, group comparisons and process monitoring."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = ["slow: Monte Carlo calibration checks (a few seconds each)"]
+filterwarnings = ["ignore::RuntimeWarning", "ignore::DeprecationWarning"]

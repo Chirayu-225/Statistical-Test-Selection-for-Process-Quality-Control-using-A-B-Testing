@@ -1,288 +1,353 @@
 """
-Statistical Test Selection and Decision Algorithm — Streamlit UI
+Stat Advisor — Streamlit app.
 
-One algorithm, two analytical lenses applied to the SAME uploaded dataset:
-  - Group Comparison (hypothesis testing): is there a real difference between groups?
-  - Time Monitoring (control charts): is the process stable or drifting over time?
+Ask a question about your data, get an answer you can act on:
+  1. pick a question   2. give it data   3. read the answer, the recommendation and WHY.
 
-Previously these were two disconnected "modes" with separate upload flows.
-They are unified here because they are the same underlying question asked
-two different ways — and a real dataset (e.g. a machine's defect rate) often
-benefits from both views without re-uploading.
+Run:  streamlit run app.py
 """
-import streamlit as st
-import pandas as pd
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
-from itertools import combinations
+import streamlit as st
+from statsmodels.stats.proportion import proportion_confint
 
-from algorithm import (
-    run_numeric_test, run_proportion_test,
-    required_sample_size_ttest, required_sample_size_anova,
-    correct_multiple_tests,
-    shewhart_individuals_chart, cusum_chart,
-)
+from stat_advisor import (analyze_comparison, analyze_counts, analyze_monitoring, infer_metric_kind,
+                          plan_conversion_test, plan_mean_test)
 
-st.set_page_config(page_title="Statistical Test Selection Algorithm", layout="wide")
+DATA = Path(__file__).parent / "data"
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+SIGNAL = "#c62828"
+MUTED = "#8a8985"
 
-st.title("Statistical Test Selection and Decision Algorithm")
-st.caption("One algorithm, applied two ways to the same data: **Group Comparison** asks whether groups "
-           "genuinely differ; **Time Monitoring** asks whether a process is drifting. Both check assumptions "
-           "first and select the statistically valid method — they never default to a t-test or a gut-feel chart read.")
+SAMPLES_COMPARE = {
+    "Checkout A/B test: did the new page lift conversion and revenue?":
+        ("checkout_ab_test.csv", dict(metric="converted", group="variant", control="A", randomized=True)),
+    "Machine defect rates: is one machine worse?":
+        ("machine_defects.csv", dict(metric="defect_rate_pct", group="machine", higher_is_better=False)),
+    "Support tickets: does one team take longer? (small, skewed samples)":
+        ("support_resolution_times.csv", dict(metric="resolution_hours", group="team", higher_is_better=False)),
+}
+SAMPLES_MONITOR = {
+    "Bottle filling line: is the fill volume drifting?": ("bottle_fill_process.csv", dict(metric="fill_volume_ml", order="batch")),
+    "Machine M3 defect rate over 60 days": ("machine_defects.csv", dict(metric="defect_rate_pct", order="date",
+                                                                         filter=("machine", "M3"))),
+}
 
-# =======================================================================
-# SIDEBAR — shared settings + planning tools (not tied to loaded data)
-# =======================================================================
-st.sidebar.header("Settings")
-alpha = st.sidebar.slider("Significance level (alpha)", 0.01, 0.10, 0.05, 0.01)
-correction_method = st.sidebar.selectbox(
-    "Multiple-comparison correction",
-    ["Benjamini-Hochberg (FDR)", "Bonferroni"],
-    help="Applied automatically whenever more than one test is run in the same session (e.g. pairwise comparisons across 3+ groups)."
-)
-_correction_key = "fdr_bh" if correction_method.startswith("Benjamini") else "bonferroni"
+st.set_page_config(page_title="Stat Advisor", layout="wide")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Sample size / power planner")
-st.sidebar.caption("Plan BEFORE collecting data.")
-planner_kind = st.sidebar.radio("Planning for", ["2 groups (t-test)", "3+ groups (ANOVA)"], key="planner_kind")
-if planner_kind.startswith("2 groups"):
-    planned_effect = st.sidebar.slider("Expected effect size (Cohen's d)", 0.1, 1.0, 0.3, 0.05, key="planner_d")
-    planned_power = st.sidebar.slider("Desired power", 0.7, 0.99, 0.8, 0.01, key="planner_power_t")
-    if st.sidebar.button("Calculate required sample size", key="planner_btn_t"):
-        n = required_sample_size_ttest(planned_effect, alpha=alpha, power=planned_power)
-        st.sidebar.success(f"Need ~{n} observations per group")
-else:
-    planned_f = st.sidebar.slider("Expected effect size (Cohen's f)", 0.1, 1.0, 0.25, 0.05, key="planner_f")
-    planned_k = st.sidebar.number_input("Number of groups", min_value=3, max_value=10, value=3, key="planner_k")
-    planned_power_a = st.sidebar.slider("Desired power", 0.7, 0.99, 0.8, 0.01, key="planner_power_a")
-    if st.sidebar.button("Calculate required sample size", key="planner_btn_a"):
-        n = required_sample_size_anova(planned_f, int(planned_k), alpha=alpha, power=planned_power_a)
-        st.sidebar.success(f"Need ~{n} observations per group")
 
-st.markdown("---")
+@st.cache_data
+def load_csv(path_or_buffer):
+    return pd.read_csv(path_or_buffer)
 
-# =======================================================================
-# SHARED DATA LOADING — one upload, used by both lenses below
-# =======================================================================
-st.subheader("1. Load your data")
 
-metric_type = st.radio(
-    "Metric type",
-    ["Numeric (revenue, defect rate, cycle time, time on page...)", "Conversion / proportion (signup rate, click-through...)"],
-    horizontal=True,
-)
-is_numeric_metric = metric_type.startswith("Numeric")
+def pick(label, options, preferred=None, key=None, help=None):
+    options = list(options)
+    idx = options.index(preferred) if preferred in options else 0
+    return st.selectbox(label, options, index=idx, key=key, help=help)
 
-df = None
-if is_numeric_metric:
-    data_source = st.radio("Data source", ["Upload CSV", "Use demo data"], horizontal=True)
-    if data_source == "Upload CSV":
-        uploaded = st.file_uploader(
-            "Upload CSV — needs a group column (e.g. variant/machine/shift) and a numeric metric column. "
-            "An optional time/order column enables the Time Monitoring tab.",
-            type="csv",
-        )
-        df = pd.read_csv(uploaded) if uploaded else None
+
+# ---------------------------------------------------------------------------
+# Report rendering (shared by all three questions)
+# ---------------------------------------------------------------------------
+
+GOOD = {"stable", "plan", "no_meaningful_difference"}
+ALERT = {"untrustworthy", "issue"}
+
+
+def render_report(report, chart=None, wide_charts=()):
+    st.markdown("### Answer")
+    if report.verdict in ALERT:
+        box = st.error
+    elif report.verdict in ("no_difference", "inconclusive", "watch", "small_difference"):
+        box = st.warning
+    elif report.verdict in GOOD:
+        box = st.success
+    else:                      # a clear difference: neutral colour, since it can be good or bad news
+        box = st.info
+    box(report.headline)
+    st.markdown(f"**What to do:** {report.recommendation}")
+
+    for w in report.warnings:
+        st.warning(w)
+
+    tables = dict(report.tables)
+    left, right = st.columns([2, 3])
+    with left:
+        st.markdown("**Key numbers**")
+        st.dataframe(pd.DataFrame(report.key_numbers, columns=["Measure", "Value"]), hide_index=True,
+                     width="stretch")
+        st.caption(f"Method: {report.method}")
+    with right:
+        if chart is not None:
+            st.plotly_chart(chart, width="stretch")
+        elif tables:                              # no chart: show the main table beside the numbers
+            name, table = next(iter(tables.items()))
+            tables.pop(name)
+            st.markdown(f"**{name}**")
+            if table is not None and len(table):
+                st.dataframe(table, hide_index=True, width="stretch")
+            else:
+                st.caption("None.")
+    for fig in wide_charts:
+        st.plotly_chart(fig, width="stretch")
+
+    with st.expander("Why this method? (the decision trail)", expanded=True):
+        st.markdown("\n".join(f"{i}. {r}" for i, r in enumerate(report.reasoning, 1)))
+
+    for name, table in tables.items():
+        if table is not None and len(table):
+            with st.expander(name, expanded=name.startswith("Which pairs") or name == "Signals"):
+                st.dataframe(table, hide_index=True, width="stretch")
+
+    st.download_button("Download this report (Markdown)", report.to_markdown(), file_name="stat_advisor_report.md",
+                       mime="text/markdown")
+
+
+# ---------------------------------------------------------------------------
+# Charts
+# ---------------------------------------------------------------------------
+
+def chart_numeric(df, metric, group, order):
+    fig = go.Figure()
+    for i, g in enumerate(order):
+        vals = df.loc[df[group] == g, metric].dropna()
+        fig.add_trace(go.Box(y=vals, name=str(g), boxpoints="all" if len(vals) <= 300 else "outliers",
+                             jitter=0.35, pointpos=0, marker=dict(size=4, opacity=0.5),
+                             line=dict(width=1.5), marker_color=SERIES[i % len(SERIES)]))
+    fig.update_layout(title=f"{metric} by {group}", showlegend=False, height=380,
+                      margin=dict(l=10, r=10, t=50, b=10), yaxis_title=metric)
+    return fig
+
+
+def chart_rates(summary):
+    lo, hi = proportion_confint(summary["conversions"], summary["total"], method="wilson")
+    rates = summary["rate"]
+    fig = go.Figure(go.Bar(
+        x=summary["group"].astype(str), y=rates, marker_color=[SERIES[i % len(SERIES)] for i in range(len(summary))],
+        error_y=dict(type="data", symmetric=False, array=hi - rates, arrayminus=rates - lo, color=MUTED, thickness=1.5),
+        text=[f"{r:.2%}" for r in rates], textposition="inside", insidetextanchor="start",
+        textfont=dict(color="white"),
+        hovertemplate="%{x}: %{y:.2%}<extra></extra>"))
+    fig.update_layout(title="Rate by group (bars show 95% intervals)", yaxis_tickformat=".1%", height=380,
+                      margin=dict(l=10, r=10, t=50, b=10), showlegend=False)
+    return fig
+
+
+def chart_monitor(m, labels, metric):
+    x = labels
+    fig = go.Figure()
+    fig.add_vrect(x0=x[0], x1=x[m.baseline_n - 1], fillcolor=MUTED, opacity=0.10, line_width=0,
+                  annotation_text="baseline", annotation_position="top left")
+    fig.add_trace(go.Scatter(x=x, y=m.values, mode="lines+markers", name=metric,
+                             line=dict(color=SERIES[0], width=2), marker=dict(size=5)))
+    for y, name, dash in ((m.ucl, "UCL", "dash"), (m.center, "center", "dot"), (m.lcl, "LCL", "dash")):
+        fig.add_hline(y=y, line_dash=dash, line_color=MUTED, annotation_text=name, annotation_position="right")
+    r1 = next(iter(m.rule_signals.values()))
+    if r1:
+        fig.add_trace(go.Scatter(x=[x[i] for i in r1], y=m.values[r1], mode="markers", name="outside limits",
+                                 marker=dict(color=SIGNAL, size=11, symbol="x")))
+    fig.update_layout(title="Individuals chart (sudden jumps)", height=330, margin=dict(l=10, r=90, t=50, b=10),
+                      legend=dict(orientation="h", y=-0.2))
+
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=x, y=m.cusum_pos, mode="lines", name="upward drift", line=dict(color=SERIES[1], width=2)))
+    fig2.add_trace(go.Scatter(x=x, y=m.cusum_neg, mode="lines", name="downward drift", line=dict(color=SERIES[0], width=2)))
+    for y in (m.cusum_h, -m.cusum_h):
+        fig2.add_hline(y=y, line_dash="dash", line_color=MUTED, annotation_text=f"threshold {y:+g}",
+                       annotation_position="right")
+    for f in m.findings:
+        if f.kind == "drift":
+            fig2.add_vline(x=x[f.start], line_color=SIGNAL, line_dash="dot",
+                           annotation_text=f"{f.direction} drift starts", annotation_position="top")
+    fig2.update_layout(title="CUSUM chart (slow drift, in sigma units)", height=330, margin=dict(l=10, r=90, t=50, b=10),
+                       legend=dict(orientation="h", y=-0.2))
+    return fig, fig2
+
+
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
+
+st.title("Stat Advisor")
+st.markdown("Ask a question about your data. Stat Advisor **checks the data first**, picks the statistically correct "
+            "method, and tells you **what the result means and what to do** — with the reasoning shown.")
+
+QUESTIONS = {
+    "compare": "Is there a real difference between groups?  (A/B test variants, machines, teams, suppliers…)",
+    "monitor": "Is my process stable, or has it shifted or drifted over time?",
+    "plan": "How much data do I need before running a test?",
+}
+st.markdown("#### 1 · What do you want to know?")
+q = st.radio("Question", list(QUESTIONS), format_func=QUESTIONS.get, label_visibility="collapsed")
+st.divider()
+
+try:
+    # ===================================================================== COMPARE
+    if q == "compare":
+        st.markdown("#### 2 · Your data")
+        source = st.radio("Source", ["Try a sample dataset", "Upload a CSV", "Type in summary numbers"],
+                          horizontal=True, label_visibility="collapsed")
+        defaults = {}
+        df = None
+        if source == "Try a sample dataset":
+            name = st.selectbox("Sample", list(SAMPLES_COMPARE))
+            file, defaults = SAMPLES_COMPARE[name]
+            df = load_csv(DATA / file)
+        elif source == "Upload a CSV":
+            up = st.file_uploader("One row per observation: a column naming the group, and a column with the "
+                                  "measurement (a number, or 0/1 / yes/no for conversions).", type="csv")
+            df = load_csv(up) if up else None
+
+        if source == "Type in summary numbers":
+            n_groups = int(st.number_input("Number of groups", 2, 8, 2))
+            cols = st.columns(n_groups)
+            names, conv, tot = [], [], []
+            for i, c in enumerate(cols):
+                with c:
+                    names.append(st.text_input("Group", ["A", "B", "C", "D", "E", "F", "G", "H"][i], key=f"n{i}"))
+                    tot.append(int(st.number_input("Users / items", 1, value=5000, key=f"t{i}")))
+                    conv.append(int(st.number_input("Converted / defective", 0, value=500 + 40 * i, key=f"s{i}")))
+            st.markdown("#### 3 · About the comparison")
+            c1, c2, c3 = st.columns(3)
+            control = c1.selectbox("Control / baseline group", names)
+            randomized = c2.checkbox("Randomized A/B test (check group sizes)", value=True)
+            hib = c3.radio("Higher rate is…", ["better", "worse"], horizontal=True) == "better"
+            with st.expander("Advanced"):
+                alpha = st.select_slider("Significance level (alpha)", [0.01, 0.05, 0.10], 0.05)
+                mm = st.number_input("Smallest difference that matters (percentage points, 0 = not set)", 0.0, 100.0, 0.0)
+            st.divider()
+            report = analyze_counts(names, conv, tot, control=control, alpha=alpha, higher_is_better=hib,
+                                    randomized=randomized, min_meaningful=mm / 100 or None)
+            render_report(report, chart_rates(report.tables["Group summary"]))
+
+        elif df is not None:
+            with st.expander("Preview data", expanded=False):
+                st.dataframe(df.head(20), width="stretch")
+            st.markdown("#### 3 · About the comparison")
+            c1, c2 = st.columns(2)
+            with c1:
+                metric = pick("What are you measuring? (metric column)", df.columns, defaults.get("metric"))
+            with c2:
+                group = pick("What defines the groups?", [c for c in df.columns if c != metric], defaults.get("group"))
+            kind = infer_metric_kind(df[metric])
+            st.caption("Detected a **yes/no outcome** — rates will be compared." if kind == "binary"
+                       else "Detected a **numeric measurement**.")
+            groups = sorted(df[group].dropna().unique().tolist(), key=str)
+            if len(groups) > 20:
+                st.error(f"'{group}' has {len(groups)} distinct values — that looks like an ID, not a group column.")
+                st.stop()
+            c1, c2, c3 = st.columns(3)
+            ctrl_opts = ["(none)"] + groups
+            control = c1.selectbox("Control / baseline group", ctrl_opts,
+                                   index=ctrl_opts.index(defaults["control"]) if defaults.get("control") in ctrl_opts else 0)
+            randomized = c2.checkbox("Randomized A/B test (check group sizes)", value=defaults.get("randomized", False))
+            hib = c3.radio("Higher values are…", ["better", "worse"], horizontal=True,
+                           index=0 if defaults.get("higher_is_better", True) else 1) == "better"
+            with st.expander("Advanced"):
+                alpha = st.select_slider("Significance level (alpha)", [0.01, 0.05, 0.10], 0.05)
+                unit = "percentage points" if kind == "binary" else f"units of {metric}"
+                mm = st.number_input(f"Smallest difference that matters ({unit}, 0 = not set)", 0.0, value=0.0)
+                split = st.text_input("Planned traffic split for the A/B test (e.g. 50,50)", "")
+                focus = "average"
+                if kind == "numeric":
+                    focus = st.radio("Compare…", ["average", "typical"], horizontal=True, format_func={
+                        "average": "Averages (default — right when totals matter, e.g. revenue)",
+                        "typical": "Typical values (robust to outliers, rank-based)"}.get)
+            st.divider()
+            mm_val = (mm / 100 if kind == "binary" else mm) or None
+            split_val = [float(s) for s in split.split(",")] if split.strip() else None
+            report = analyze_comparison(df, metric, group, control=None if control == "(none)" else control,
+                                        alpha=alpha, higher_is_better=hib, randomized=randomized,
+                                        expected_split=split_val, min_meaningful=mm_val, focus=focus)
+            order = report.result.groups
+            chart = (chart_rates(report.tables["Group summary"]) if kind == "binary"
+                     else chart_numeric(df, metric, group, order))
+            render_report(report, chart)
+            if kind == "binary" and source == "Try a sample dataset":
+                st.info("Tip: switch the metric to **revenue** to see how the advisor handles a heavily skewed "
+                        "numeric metric.")
+
+    # ===================================================================== MONITOR
+    elif q == "monitor":
+        st.markdown("#### 2 · Your data")
+        source = st.radio("Source", ["Try a sample dataset", "Upload a CSV"], horizontal=True,
+                          label_visibility="collapsed")
+        defaults, df = {}, None
+        if source == "Try a sample dataset":
+            name = st.selectbox("Sample", list(SAMPLES_MONITOR))
+            file, defaults = SAMPLES_MONITOR[name]
+            df = load_csv(DATA / file)
+        else:
+            up = st.file_uploader("One row per measurement, ideally with a time or sequence column.", type="csv")
+            df = load_csv(up) if up else None
+
+        if df is not None:
+            st.markdown("#### 3 · About the process")
+            num_cols = df.select_dtypes(include=np.number).columns.tolist()
+            if not num_cols:
+                st.error("No numeric columns found to monitor.")
+                st.stop()
+            c1, c2, c3 = st.columns(3)
+            metric = pick("Measurement to monitor", num_cols, defaults.get("metric"))
+            order_opts = ["(row order)"] + [c for c in df.columns if c != metric]
+            order = pick("Time / sequence column", order_opts, defaults.get("order"))
+            filt_opts = ["(all rows)"] + [c for c in df.columns if c not in (metric, order) and df[c].nunique() <= 20]
+            dflt_filter = defaults.get("filter", (None, None))
+            src_key = name if source == "Try a sample dataset" else "upload"
+            fcol = pick("Only one group? (filter column)", filt_opts, dflt_filter[0], key=f"fcol-{src_key}",
+                        help="Monitor one machine/line at a time — mixing groups hides real changes.")
+            sub = df
+            if fcol != "(all rows)":
+                vals = sorted(df[fcol].dropna().unique().tolist(), key=str)
+                fval = pick(f"Which {fcol}?", vals, dflt_filter[1], key=f"fval-{src_key}-{fcol}")
+                sub = df[df[fcol] == fval]
+            n = len(sub.dropna(subset=[metric]))
+            with st.expander("Advanced"):
+                base = st.slider("Baseline period: learn 'normal' from the first N points", 8, max(9, n),
+                                 min(100, max(8, n // 2)), key=f"base-{metric}-{order}-{fcol}-{n}")
+                sensitive = st.checkbox("Sensitive mode (Western Electric rules 2-4 + moving-range chart; "
+                                        "faster detection, more false alarms)")
+                sig = st.slider("Control limit width (sigma)", 2.0, 4.0, 3.0, 0.5)
+                h = st.slider("CUSUM threshold h (higher = fewer false alarms, slower detection)", 3.0, 8.0, 5.0, 0.5)
+            st.divider()
+            report = analyze_monitoring(sub, metric, order_col=None if order == "(row order)" else order,
+                                        baseline_n=base, sensitive_rules=sensitive, sigma_multiplier=sig, cusum_h=h)
+            ordered = sub.sort_values(order, kind="stable") if order != "(row order)" else sub
+            ordered = ordered.dropna(subset=[metric])
+            labels = (ordered[order].tolist() if order != "(row order)" else list(range(1, len(ordered) + 1)))
+            f1, f2 = chart_monitor(report.result, labels, metric)
+            render_report(report, None, wide_charts=(f1, f2))
+
+    # ===================================================================== PLAN
     else:
-        rng = np.random.default_rng(11)
-        n_per_group = 60
-        g1 = rng.normal(2.0, 0.4, n_per_group)
-        g2 = rng.normal(2.1, 0.4, n_per_group)
-        g3 = rng.normal(3.2, 0.4, n_per_group)
-        df = pd.DataFrame({
-            "order": np.arange(n_per_group * 3),
-            "group": ["Group A"] * n_per_group + ["Group B"] * n_per_group + ["Group C"] * n_per_group,
-            "value": np.concatenate([g1, g2, g3]),
-        })
-        st.info("Using demo data: a metric (e.g. defect rate) across 3 groups (e.g. machines), "
-                "with Group C running worse — same dataset drives both tabs below.")
-
-    if df is not None:
-        st.dataframe(df.head(), use_container_width=True)
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            group_col = st.selectbox("Group column", df.columns,
-                                      index=list(df.columns).index("group") if "group" in df.columns else 0)
-        with col2:
-            numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-            value_col = st.selectbox("Metric column", numeric_cols,
-                                      index=numeric_cols.index("value") if "value" in numeric_cols else 0)
-        with col3:
-            order_options = ["(row order)"] + list(df.columns)
-            order_col = st.selectbox("Time/order column (optional, for Time Monitoring)", order_options)
-
-else:
-    st.caption("Proportions are entered directly (typical for conversion-rate comparisons) — "
-               "Time Monitoring isn't shown for this metric type since it needs a continuous series.")
-    n_groups = st.number_input("Number of groups", min_value=2, max_value=6, value=2)
-    names, successes, totals = [], [], []
-    cols = st.columns(int(n_groups))
-    for i in range(int(n_groups)):
-        with cols[i]:
-            name = st.text_input("Group name", value=f"Group{i+1}", key=f"p_name_{i}")
-            s = st.number_input("Conversions", min_value=0, value=100 + i * 20, key=f"p_s_{i}")
-            t = st.number_input("Total", min_value=1, value=1000, key=f"p_t_{i}")
-            names.append(name); successes.append(int(s)); totals.append(int(t))
-
-st.markdown("---")
-
-# =======================================================================
-# TWO LENSES on the same data
-# =======================================================================
-if is_numeric_metric:
-    st.subheader("2. Analyze")
-    tab1, tab2 = st.tabs(["Group Comparison (hypothesis testing)", "Time Monitoring (control charts)"])
-
-    with tab1:
-        if df is None:
-            st.info("Load data above to run a comparison.")
-        else:
-            k_groups = df[group_col].nunique()
-            if st.button("Run group comparison", type="primary", key="run_group_cmp"):
-                result = run_numeric_test(df, value_col, group_col, alpha=alpha)
-
-                verdict_color = "green" if result.significant else "orange"
-                st.markdown("### Verdict")
-                st.markdown(f":{verdict_color}[{result.verdict}]")
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Test used", result.test_used)
-                c2.metric("p-value", f"{result.p_value:.4f}")
-                c3.metric("Effect size", f"{result.effect_size} ({result.effect_size_label})")
-                c4.metric("Significant?", "Yes" if result.significant else "No")
-
-                with st.expander("Assumption checks (why this test was chosen)"):
-                    st.write("**Normality (Shapiro-Wilk)**")
-                    st.json(result.assumptions["normality"])
-                    st.write("**Variance homogeneity (Levene's test)**")
-                    st.json(result.assumptions["variance_homogeneity"])
-
-                st.subheader(f"{value_col} by {group_col}")
-                fig = px.box(df, x=group_col, y=value_col, color=group_col, points="all")
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.subheader("Group summary")
-                st.dataframe(result.group_summary, use_container_width=True)
-
-                if result.confidence_interval != (None, None):
-                    st.caption(f"95% CI on difference: {result.confidence_interval}")
-
-                st.session_state["last_group_result"] = {"k": k_groups}
-
-            # Pairwise comparisons + multiple-comparison correction — only meaningful for 3+ groups
-            if k_groups >= 3:
-                st.markdown("---")
-                st.markdown("**More than 2 groups detected.** Running every pair separately inflates the "
-                             "chance of a false positive — this runs all pairs and corrects for it.")
-                if st.button("Run all pairwise comparisons (with correction)", key="run_pairwise"):
-                    group_names = sorted(df[group_col].dropna().unique().tolist())
-                    rows = []
-                    for g1, g2 in combinations(group_names, 2):
-                        sub = df[df[group_col].isin([g1, g2])]
-                        r = run_numeric_test(sub, value_col, group_col, alpha=alpha)
-                        rows.append({"pair": f"{g1} vs {g2}", "test": r.test_used,
-                                     "raw_p": r.p_value, "effect_size": r.effect_size})
-
-                    pairwise_df = pd.DataFrame(rows)
-                    corrected = correct_multiple_tests(pairwise_df["raw_p"].tolist(), method=_correction_key, alpha=alpha)
-                    pairwise_df["adjusted_p"] = corrected["p_adjusted"]
-                    pairwise_df["significant_after_correction"] = corrected["significant_after_correction"]
-
-                    st.dataframe(pairwise_df, use_container_width=True)
-                    n_sig_raw = (pairwise_df["raw_p"] < alpha).sum()
-                    n_sig_corrected = pairwise_df["significant_after_correction"].sum()
-                    if n_sig_raw != n_sig_corrected:
-                        st.warning(f"{n_sig_raw} pair(s) looked significant before correction, but only "
-                                    f"{n_sig_corrected} remain significant after {correction_method} correction — "
-                                    f"the rest were likely false positives from running multiple tests.")
-                    else:
-                        st.success(f"{n_sig_corrected} pair(s) remain significant after correction — "
-                                    f"consistent with the uncorrected result.")
-
-    with tab2:
-        if df is None:
-            st.info("Load data above to run control charts.")
-        else:
-            sigma_mult = st.slider("Shewhart control limit width (sigma)", 2.0, 4.0, 3.0, 0.5)
-            cusum_k = st.slider("CUSUM slack (k, in sigma units)", 0.25, 1.5, 0.5, 0.25)
-            cusum_h = st.slider("CUSUM decision threshold (h, in sigma units)", 3.0, 8.0, 5.0, 0.5)
-
-            chart_slice = st.selectbox("Run control chart on which slice?",
-                                        ["All data combined"] + sorted(df[group_col].dropna().unique().tolist()))
-            if chart_slice == "All data combined" and df[group_col].nunique() > 1:
-                st.caption("Note: combining groups stacks their data back-to-back rather than a true shared "
-                            "timeline — a step-change here may just reflect the group boundary, not real drift. "
-                            "Select a single group above for a genuine time-ordered read.")
-
-            if st.button("Run control chart analysis", type="primary", key="run_cc"):
-                subset = df if chart_slice == "All data combined" else df[df[group_col] == chart_slice]
-                if order_col != "(row order)":
-                    subset = subset.sort_values(order_col)
-                series = subset[value_col].dropna().values
-                x_axis = list(range(len(series)))
-
-                shew = shewhart_individuals_chart(series, sigma_multiplier=sigma_mult)
-                cus = cusum_chart(series, k=cusum_k, h=cusum_h)
-
-                st.markdown("### Shewhart Individuals chart (catches sudden shifts)")
-                st.markdown(f":{'orange' if shew.n_violations else 'green'}[{shew.verdict}]")
-                fig1 = go.Figure()
-                fig1.add_trace(go.Scatter(x=x_axis, y=series, mode="lines+markers", name=value_col))
-                fig1.add_hline(y=shew.center_line, line_dash="dot", line_color="gray", annotation_text="center")
-                fig1.add_hline(y=shew.ucl, line_dash="dash", line_color="red", annotation_text="UCL")
-                fig1.add_hline(y=shew.lcl, line_dash="dash", line_color="red", annotation_text="LCL")
-                if shew.violations:
-                    fig1.add_trace(go.Scatter(
-                        x=[x_axis[i] for i in shew.violations], y=[series[i] for i in shew.violations],
-                        mode="markers", marker=dict(color="red", size=12, symbol="x"), name="out of control"
-                    ))
-                fig1.update_layout(title="Shewhart Individuals Chart", xaxis_title="Order", yaxis_title=value_col)
-                st.plotly_chart(fig1, use_container_width=True)
-
-                st.markdown("### CUSUM chart (catches gradual drift)")
-                st.markdown(f":{'orange' if cus.n_violations else 'green'}[{cus.verdict}]")
-                sh_pos = [v[0] for v in cus.values]
-                sh_neg = [v[1] for v in cus.values]
-                fig2 = go.Figure()
-                fig2.add_trace(go.Scatter(x=x_axis, y=sh_pos, mode="lines", name="CUSUM+ (upward)"))
-                fig2.add_trace(go.Scatter(x=x_axis, y=sh_neg, mode="lines", name="CUSUM- (downward)"))
-                fig2.add_hline(y=cus.ucl, line_dash="dash", line_color="red", annotation_text=f"h=+{cusum_h}")
-                fig2.add_hline(y=cus.lcl, line_dash="dash", line_color="red", annotation_text=f"h=-{cusum_h}")
-                if cus.violations:
-                    fig2.add_trace(go.Scatter(
-                        x=[x_axis[i] for i in cus.violations],
-                        y=[sh_pos[i] if abs(sh_pos[i]) >= abs(sh_neg[i]) else sh_neg[i] for i in cus.violations],
-                        mode="markers", marker=dict(color="red", size=10, symbol="x"), name="drift detected"
-                    ))
-                fig2.update_layout(title="CUSUM Chart", xaxis_title="Order", yaxis_title="Cumulative deviation (sigma units)")
-                st.plotly_chart(fig2, use_container_width=True)
-
-else:
-    st.subheader("2. Analyze")
-    if st.button("Run group comparison", type="primary", key="run_prop_cmp"):
-        result = run_proportion_test(successes, totals, group_names=names, alpha=alpha)
-
-        verdict_color = "green" if result.significant else "orange"
-        st.markdown("### Verdict")
-        st.markdown(f":{verdict_color}[{result.verdict}]")
-
+        st.markdown("#### 2 · What will you measure?")
+        kind = st.radio("Metric", ["A conversion rate (yes/no outcome)", "An average (revenue, time, defect rate…)"],
+                        horizontal=True, label_visibility="collapsed")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Test used", result.test_used)
-        c2.metric("p-value", f"{result.p_value:.4f}")
-        c3.metric("Effect size", f"{result.effect_size} ({result.effect_size_label})")
-        c4.metric("Significant?", "Yes" if result.significant else "No")
+        groups = int(c4.number_input("Groups (incl. control)", 2, 8, 2))
+        traffic = c4.number_input("Users/items per day (optional)", 0, value=0)
+        alpha = c3.select_slider("Significance level", [0.01, 0.05, 0.10], 0.05)
+        power = c3.select_slider("Power (chance of detecting a real effect)", [0.7, 0.8, 0.9, 0.95], 0.8)
+        if kind.startswith("A conversion"):
+            base = c1.number_input("Current conversion rate (%)", 0.1, 99.0, 10.0) / 100
+            lift = c2.number_input("Smallest relative lift worth detecting (%)", 0.5, 500.0, 10.0) / 100
+            report = plan_conversion_test(base, lift, alpha=alpha, power=power, groups=groups,
+                                          daily_traffic=traffic or None)
+        else:
+            sd = c1.number_input("Typical standard deviation of the metric", 0.0001, value=10.0)
+            diff = c2.number_input("Smallest difference worth detecting (same units)", 0.0001, value=2.0)
+            report = plan_mean_test(sd, diff, alpha=alpha, power=power, groups=groups, daily_traffic=traffic or None)
+        st.divider()
+        render_report(report)
 
-        rates = [s / t for s, t in zip(successes, totals)]
-        fig = go.Figure(go.Bar(x=names, y=rates, text=[f"{r:.2%}" for r in rates], textposition="auto"))
-        fig.update_layout(title="Conversion rate by group", yaxis_tickformat=".1%")
-        st.plotly_chart(fig, use_container_width=True)
+except ValueError as e:
+    st.error(f"Can't analyse this data: {e}")
 
-        if result.confidence_interval != (None, None):
-            st.caption(f"95% CI on difference in rates: {result.confidence_interval}")
-
-st.markdown("---")
-st.caption("Core algorithm: checks normality (Shapiro-Wilk) and variance homogeneity (Levene's test) before "
-           "selecting between t-test / Mann-Whitney / ANOVA / Kruskal-Wallis / two-proportion z-test / chi-square. "
-           "Control charts (Shewhart + CUSUM) run on the same validated core.")
+st.divider()
+st.caption("Methods: Welch's t-test / Welch's ANOVA + Games-Howell, Brunner-Munzel / Mann-Whitney / Kruskal-Wallis + Dunn, "
+           "two-proportion z / Boschloo exact / chi-square, sample-ratio-mismatch check, Individuals + CUSUM control "
+           "charts with a baseline period, power analysis. See docs/METHODOLOGY.md.")
